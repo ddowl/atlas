@@ -635,3 +635,28 @@ func (d *diff) ProcFuncsDiff(from, to *schema.Schema, opts *schema.DiffOptions) 
 	}
 	return changes, nil
 }
+
+// TriggerDiff implements the sqlx.TriggerDiffer interface.
+// It returns a ModifyTrigger change when any trigger attribute (action time, events, for, body) differs.
+func (d *diff) TriggerDiff(from, to *schema.Trigger) ([]schema.Change, error) {
+	if triggerEqual(from, to) {
+		return nil, nil
+	}
+	return []schema.Change{&schema.ModifyTrigger{From: from, To: to}}, nil
+}
+
+// triggerEqual reports whether two triggers have the same definition (action time, events, for, body).
+func triggerEqual(a, b *schema.Trigger) bool {
+	if a.ActionTime != b.ActionTime || a.For != b.For || a.Body != b.Body {
+		return false
+	}
+	if len(a.Events) != len(b.Events) {
+		return false
+	}
+	for i := range a.Events {
+		if a.Events[i].Name != b.Events[i].Name {
+			return false
+		}
+	}
+	return true
+}

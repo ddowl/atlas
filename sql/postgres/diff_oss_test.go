@@ -807,3 +807,155 @@ func TestDiff_ProcFuncsDiff(t *testing.T) {
 		require.Equal(t, "return_one", changes[0].(*schema.AddFunc).F.Name)
 	})
 }
+
+func TestDiff_TriggerDiff(t *testing.T) {
+	t.Run("add trigger", func(t *testing.T) {
+		db, m, err := sqlmock.New()
+		require.NoError(t, err)
+		mock{m}.version("150000")
+		drv, err := Open(db)
+		require.NoError(t, err)
+		s := schema.New("public")
+		from := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		to := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		tr := &schema.Trigger{
+			Name:       "tr_audit",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "EXECUTE FUNCTION audit_fn()",
+		}
+		tr.Table = to
+		to.Triggers = []*schema.Trigger{tr}
+		changes, err := drv.TableDiff(from, to)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		require.IsType(t, &schema.AddTrigger{}, changes[0])
+		require.Equal(t, "tr_audit", changes[0].(*schema.AddTrigger).T.Name)
+	})
+
+	t.Run("drop trigger", func(t *testing.T) {
+		db, m, err := sqlmock.New()
+		require.NoError(t, err)
+		mock{m}.version("150000")
+		drv, err := Open(db)
+		require.NoError(t, err)
+		s := schema.New("public")
+		from := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		tr := &schema.Trigger{
+			Name:       "tr_old",
+			ActionTime: schema.TriggerTimeAfter,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "DELETE"}},
+		}
+		tr.Table = from
+		from.Triggers = []*schema.Trigger{tr}
+		to := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		changes, err := drv.TableDiff(from, to)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		require.IsType(t, &schema.DropTrigger{}, changes[0])
+		require.Equal(t, "tr_old", changes[0].(*schema.DropTrigger).T.Name)
+	})
+
+	t.Run("no trigger change", func(t *testing.T) {
+		db, m, err := sqlmock.New()
+		require.NoError(t, err)
+		mock{m}.version("150000")
+		drv, err := Open(db)
+		require.NoError(t, err)
+		s := schema.New("public")
+		from := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		to := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		trFrom := &schema.Trigger{
+			Name:       "tr_same",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "SELECT 1",
+		}
+		trFrom.Table = from
+		from.Triggers = []*schema.Trigger{trFrom}
+		trTo := &schema.Trigger{
+			Name:       "tr_same",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "SELECT 1",
+		}
+		trTo.Table = to
+		to.Triggers = []*schema.Trigger{trTo}
+		changes, err := drv.TableDiff(from, to)
+		require.NoError(t, err)
+		require.Empty(t, changes)
+	})
+
+	t.Run("modify trigger", func(t *testing.T) {
+		db, m, err := sqlmock.New()
+		require.NoError(t, err)
+		mock{m}.version("150000")
+		drv, err := Open(db)
+		require.NoError(t, err)
+		s := schema.New("public")
+		from := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		to := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+		trFrom := &schema.Trigger{
+			Name:       "tr_notify",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "RETURN OLD",
+		}
+		trFrom.Table = from
+		from.Triggers = []*schema.Trigger{trFrom}
+		trTo := &schema.Trigger{
+			Name:       "tr_notify",
+			ActionTime: schema.TriggerTimeAfter,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "RETURN NEW",
+		}
+		trTo.Table = to
+		to.Triggers = []*schema.Trigger{trTo}
+		changes, err := drv.TableDiff(from, to)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		mod, ok := changes[0].(*schema.ModifyTrigger)
+		require.True(t, ok)
+		require.Equal(t, "tr_notify", mod.From.Name)
+		require.Equal(t, schema.TriggerTimeBefore, mod.From.ActionTime)
+		require.Equal(t, schema.TriggerTimeAfter, mod.To.ActionTime)
+		require.Equal(t, "RETURN NEW", mod.To.Body)
+	})
+
+	t.Run("TriggerDiff method — equal triggers", func(t *testing.T) {
+		d := &diff{&conn{ExecQuerier: sqlx.NoRows}}
+		from := &schema.Trigger{
+			Name: "t1", ActionTime: schema.TriggerTimeAfter, For: schema.TriggerFor("FOR EACH ROW"),
+			Events: []schema.TriggerEvent{{Name: "INSERT"}}, Body: "SELECT 1",
+		}
+		to := &schema.Trigger{
+			Name: "t1", ActionTime: schema.TriggerTimeAfter, For: schema.TriggerFor("FOR EACH ROW"),
+			Events: []schema.TriggerEvent{{Name: "INSERT"}}, Body: "SELECT 1",
+		}
+		changes, err := d.TriggerDiff(from, to)
+		require.NoError(t, err)
+		require.Empty(t, changes)
+	})
+
+	t.Run("TriggerDiff method — different body", func(t *testing.T) {
+		d := &diff{&conn{ExecQuerier: sqlx.NoRows}}
+		from := &schema.Trigger{
+			Name: "t1", ActionTime: schema.TriggerTimeAfter, For: schema.TriggerFor("FOR EACH ROW"),
+			Events: []schema.TriggerEvent{{Name: "INSERT"}}, Body: "SELECT 1",
+		}
+		to := &schema.Trigger{
+			Name: "t1", ActionTime: schema.TriggerTimeAfter, For: schema.TriggerFor("FOR EACH ROW"),
+			Events: []schema.TriggerEvent{{Name: "INSERT"}}, Body: "SELECT 2",
+		}
+		changes, err := d.TriggerDiff(from, to)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		require.IsType(t, &schema.ModifyTrigger{}, changes[0])
+	})
+}

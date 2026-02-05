@@ -653,10 +653,6 @@ func (*inspect) inspectObjects(context.Context, *schema.Realm, *schema.InspectOp
 	return nil // unimplemented.
 }
 
-func (*inspect) inspectTriggers(context.Context, *schema.Realm, *schema.InspectOptions) error {
-	return nil // unimplemented.
-}
-
 func (*inspect) inspectDeps(context.Context, *schema.Realm, *schema.InspectOptions) error {
 	return nil // unimplemented.
 }
@@ -904,20 +900,158 @@ func (s *state) modifyObject(modify *schema.ModifyObject) error {
 	return nil // unimplemented.
 }
 
-func (*state) addTrigger(*schema.AddTrigger) error {
+// triggerSchema returns the schema for the trigger's table or view.
+func triggerSchema(tr *schema.Trigger) *schema.Schema {
+	if tr.Table != nil {
+		return tr.Table.Schema
+	}
+	return tr.View.Schema
+}
+
+// triggerRelation builds "ON schema.relation" for the trigger's table or view.
+func (s *state) triggerRelation(b *sqlx.Builder, tr *schema.Trigger) {
+	b.P("ON")
+	if tr.Table != nil {
+		b.Table(tr.Table)
+	} else {
+		b.View(tr.View)
+	}
+}
+
+// triggerFuncName returns the name of the function used to implement the trigger body.
+// PostgreSQL triggers call a function; we create one with this naming convention.
+func triggerFuncName(tr *schema.Trigger) string {
+	return tr.Name + "_trigger_func"
+}
+
+// triggerFunc returns the schema.Func this trigger executes, if it depends on an existing function (Deps).
+// Otherwise returns nil and the planner should create an inline function.
+func triggerFunc(tr *schema.Trigger, sc *schema.Schema) *schema.Func {
+	for _, dep := range tr.Deps {
+		if f, ok := dep.(*schema.Func); ok && f.Schema == sc {
+			return f
+		}
+	}
+	return nil
+}
+
+func (s *state) addTrigger(add *schema.AddTrigger) error {
+	tr := add.T
+	sc := triggerSchema(tr)
+	if sc == nil {
+		return fmt.Errorf("trigger %q has no table or view", tr.Name)
+	}
+	body := tr.Body
+	if body == "" {
+		body = "RETURN NULL"
+	}
+	// Use existing function from Deps if present; otherwise create an inline function.
+	execFunc := triggerFunc(tr, sc)
+	useExistingFunc := execFunc != nil
+	if !useExistingFunc {
+		execFunc = &schema.Func{Name: triggerFuncName(tr), Schema: sc}
+	}
+	// Create the trigger (always). Create the function only when not using an existing one.
+	var createFuncCmd, dropFuncCmd string
+	if !useExistingFunc {
+		createFunc := s.Build("CREATE OR REPLACE FUNCTION")
+		createFunc.Func(execFunc).P("()")
+		createFunc.P("RETURNS trigger LANGUAGE plpgsql AS").P(funcBodyQuote(body))
+		createFuncCmd = createFunc.String() + ";\n"
+		dropFuncB := s.Build("DROP FUNCTION IF EXISTS")
+		dropFuncB.Func(execFunc).P("()").P("CASCADE")
+		dropFuncCmd = dropFuncB.String() + ";\n"
+	}
+	events := make([]string, 0, len(tr.Events))
+	for _, e := range tr.Events {
+		events = append(events, e.Name)
+	}
+	createTrig := s.Build("CREATE TRIGGER").Ident(tr.Name)
+	createTrig.P(string(tr.ActionTime))
+	createTrig.P(strings.Join(events, " OR "))
+	s.triggerRelation(createTrig, tr)
+	createTrig.P(string(tr.For))
+	createTrig.P("EXECUTE FUNCTION").Func(execFunc).P("()")
+	createTrigCmd := createTrig.String()
+	dropTrigB := s.Build("DROP TRIGGER IF EXISTS").Ident(tr.Name)
+	dropTrigB.P("ON")
+	if tr.Table != nil {
+		dropTrigB.Table(tr.Table)
+	} else {
+		dropTrigB.View(tr.View)
+	}
+	dropTrigCmd := dropTrigB.String()
+	s.append(&migrate.Change{
+		Source:  add,
+		Cmd:     createFuncCmd + createTrigCmd,
+		Reverse: dropTrigCmd + dropFuncCmd,
+		Comment: fmt.Sprintf("create trigger %q", tr.Name),
+	})
+	return nil
+}
+
+func (s *state) dropTrigger(drop *schema.DropTrigger) error {
+	tr := drop.T
+	dropB := s.Build("DROP TRIGGER IF EXISTS").Ident(tr.Name)
+	dropB.P("ON")
+	if tr.Table != nil {
+		dropB.Table(tr.Table)
+	} else {
+		dropB.View(tr.View)
+	}
+	dropCmd := dropB.String()
+	rs := &state{conn: s.conn, PlanOptions: s.PlanOptions}
+	if err := rs.addTrigger(&schema.AddTrigger{T: tr}); err != nil {
+		return fmt.Errorf("reverse of drop trigger %q: %w", tr.Name, err)
+	}
+	if len(rs.Changes) != 1 {
+		return fmt.Errorf("unexpected addTrigger reverse changes: %d", len(rs.Changes))
+	}
+	s.append(&migrate.Change{
+		Source:  drop,
+		Cmd:     dropCmd,
+		Reverse: rs.Changes[0].Cmd,
+		Comment: fmt.Sprintf("drop trigger %q", tr.Name),
+	})
+	return nil
+}
+
+func (s *state) renameTrigger(*schema.RenameTrigger) error {
 	return nil // unimplemented.
 }
 
-func (*state) dropTrigger(*schema.DropTrigger) error {
-	return nil // unimplemented.
-}
-
-func (*state) renameTrigger(*schema.RenameTrigger) error {
-	return nil // unimplemented.
-}
-
-func (*state) modifyTrigger(*schema.ModifyTrigger) error {
-	return nil // unimplemented.
+func (s *state) modifyTrigger(modify *schema.ModifyTrigger) error {
+	// Modify = drop from + add to. Reverse = drop to + add from.
+	rsAdd := &state{conn: s.conn, PlanOptions: s.PlanOptions}
+	if err := rsAdd.addTrigger(&schema.AddTrigger{T: modify.To}); err != nil {
+		return err
+	}
+	if len(rsAdd.Changes) != 1 {
+		return fmt.Errorf("unexpected addTrigger changes: %d", len(rsAdd.Changes))
+	}
+	dropFromB := s.Build("DROP TRIGGER IF EXISTS").Ident(modify.From.Name)
+	dropFromB.P("ON")
+	if modify.From.Table != nil {
+		dropFromB.Table(modify.From.Table)
+	} else {
+		dropFromB.View(modify.From.View)
+	}
+	cmd := dropFromB.String() + ";\n" + rsAdd.Changes[0].Cmd
+	rsRev := &state{conn: s.conn, PlanOptions: s.PlanOptions}
+	if err := rsRev.addTrigger(&schema.AddTrigger{T: modify.From}); err != nil {
+		return fmt.Errorf("reverse of modify trigger %q: %w", modify.To.Name, err)
+	}
+	if len(rsRev.Changes) != 1 {
+		return fmt.Errorf("unexpected addTrigger reverse changes: %d", len(rsRev.Changes))
+	}
+	reverse := rsAdd.Changes[0].Reverse.(string) + ";\n" + rsRev.Changes[0].Cmd
+	s.append(&migrate.Change{
+		Source:  modify,
+		Cmd:     cmd,
+		Reverse: reverse,
+		Comment: fmt.Sprintf("modify trigger %q", modify.To.Name),
+	})
+	return nil
 }
 
 func (*diff) ViewAttrChanges(_, _ *schema.View) []schema.Change {
