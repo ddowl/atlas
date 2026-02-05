@@ -2085,3 +2085,130 @@ func TestPlan_FuncChanges(t *testing.T) {
 		require.Empty(t, plan.Changes, "extension-owned function should not produce DROP in plan")
 	})
 }
+
+func TestPlanChanges_Triggers(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mock{m}.version("150000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+
+	s := schema.New("public")
+	tbl := schema.NewTable("users").SetSchema(s).AddColumns(schema.NewIntColumn("id", "int"))
+
+	t.Run("AddTrigger", func(t *testing.T) {
+		tr := &schema.Trigger{
+			Name:       "tr_audit",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}, {Name: "UPDATE"}},
+			Body:       "RETURN NEW",
+		}
+		tr.Table = tbl
+		plan, err := drv.PlanChanges(context.Background(), "add_trigger", []schema.Change{
+			&schema.AddTrigger{T: tr},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		cmd := plan.Changes[0].Cmd
+		require.Contains(t, cmd, "CREATE OR REPLACE FUNCTION")
+		require.Contains(t, cmd, "tr_audit_trigger_func")
+		require.Contains(t, cmd, "RETURNS trigger")
+		require.Contains(t, cmd, "CREATE TRIGGER")
+		require.Contains(t, cmd, `"tr_audit"`)
+		require.Contains(t, cmd, "BEFORE")
+		require.Contains(t, cmd, "INSERT")
+		require.Contains(t, cmd, "UPDATE")
+		require.Contains(t, cmd, "ON")
+		require.Contains(t, cmd, "users")
+		require.Contains(t, cmd, "FOR EACH ROW")
+		require.Contains(t, cmd, "EXECUTE FUNCTION")
+		rev, _ := plan.Changes[0].Reverse.(string)
+		require.Contains(t, rev, "DROP TRIGGER")
+		require.Contains(t, rev, "tr_audit")
+		require.Contains(t, rev, "DROP FUNCTION")
+	})
+
+	t.Run("AddTrigger_with_existing_function", func(t *testing.T) {
+		existingFunc := &schema.Func{Name: "trigger_func", Schema: s}
+		tr := &schema.Trigger{
+			Name:       "trigger_return_one",
+			ActionTime: schema.TriggerTimeAfter,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "RETURN 1",
+			Deps:       []schema.Object{existingFunc},
+		}
+		tr.Table = tbl
+		plan, err := drv.PlanChanges(context.Background(), "add_trigger_existing_func", []schema.Change{
+			&schema.AddTrigger{T: tr},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		cmd := plan.Changes[0].Cmd
+		// Must not create a synthetic function; must reference the existing one.
+		require.NotContains(t, cmd, "trigger_return_one_trigger_func")
+		require.Contains(t, cmd, `"trigger_func"`)
+		require.Contains(t, cmd, "CREATE TRIGGER")
+		require.Contains(t, cmd, `"trigger_return_one"`)
+		require.Contains(t, cmd, "EXECUTE FUNCTION")
+		// Reverse should only drop the trigger, not the function.
+		rev, _ := plan.Changes[0].Reverse.(string)
+		require.Contains(t, rev, "DROP TRIGGER")
+		require.NotContains(t, rev, "DROP FUNCTION")
+	})
+
+	t.Run("DropTrigger", func(t *testing.T) {
+		tr := &schema.Trigger{
+			Name:       "tr_old",
+			ActionTime: schema.TriggerTimeAfter,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "DELETE"}},
+			Body:       "RETURN OLD",
+		}
+		tr.Table = tbl
+		plan, err := drv.PlanChanges(context.Background(), "drop_trigger", []schema.Change{
+			&schema.DropTrigger{T: tr},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		require.Contains(t, plan.Changes[0].Cmd, "DROP TRIGGER")
+		require.Contains(t, plan.Changes[0].Cmd, "tr_old")
+		require.Contains(t, plan.Changes[0].Reverse.(string), "CREATE OR REPLACE FUNCTION")
+		require.Contains(t, plan.Changes[0].Reverse.(string), "CREATE TRIGGER")
+	})
+
+	t.Run("ModifyTrigger", func(t *testing.T) {
+		from := &schema.Trigger{
+			Name:       "tr_notify",
+			ActionTime: schema.TriggerTimeBefore,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "RETURN OLD",
+		}
+		from.Table = tbl
+		to := &schema.Trigger{
+			Name:       "tr_notify",
+			ActionTime: schema.TriggerTimeAfter,
+			For:        schema.TriggerFor("FOR EACH ROW"),
+			Events:     []schema.TriggerEvent{{Name: "INSERT"}},
+			Body:       "RETURN NEW",
+		}
+		to.Table = tbl
+		plan, err := drv.PlanChanges(context.Background(), "modify_trigger", []schema.Change{
+			&schema.ModifyTrigger{From: from, To: to},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		cmd := plan.Changes[0].Cmd
+		require.Contains(t, cmd, "DROP TRIGGER")
+		require.Contains(t, cmd, "tr_notify")
+		require.Contains(t, cmd, "CREATE OR REPLACE FUNCTION")
+		require.Contains(t, cmd, "CREATE TRIGGER")
+		require.Contains(t, cmd, "AFTER")
+		rev := plan.Changes[0].Reverse.(string)
+		require.Contains(t, rev, "DROP TRIGGER")
+		require.Contains(t, rev, "CREATE OR REPLACE FUNCTION")
+		require.Contains(t, rev, "CREATE TRIGGER")
+	})
+}

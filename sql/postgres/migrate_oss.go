@@ -107,6 +107,12 @@ func (s *state) plan(changes []schema.Change) error {
 			err = s.dropFunc(c)
 		case *schema.ModifyFunc:
 			err = s.modifyFunc(c)
+		case *schema.AddTrigger:
+			err = s.addTrigger(c)
+		case *schema.DropTrigger:
+			err = s.dropTrigger(c)
+		case *schema.ModifyTrigger:
+			err = s.modifyTrigger(c)
 		default:
 			err = fmt.Errorf("unsupported change %T", c)
 		}

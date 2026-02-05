@@ -31,6 +31,7 @@ var (
 	queryIndexes     = sqltest.Escape(fmt.Sprintf(indexesAbove15, "$2"))
 	queryCRDBIndexes = sqltest.Escape(fmt.Sprintf(crdbIndexesQuery, "$2"))
 	queryFuncs       = sqltest.Escape(fmt.Sprintf(functionsQuery, "$1"))
+	queryTriggers    = sqltest.Escape(fmt.Sprintf(triggersQuery, "$1"))
 )
 
 func TestDriver_InspectTable(t *testing.T) {
@@ -550,6 +551,159 @@ func TestDriver_InspectFuncs_empty(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Empty(t, s.Funcs)
+}
+
+func TestDriver_InspectTriggers(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("150000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+	drv.(*Driver).schema = "public"
+
+	// InspectSchema with InspectTables + InspectTriggers: schemas, tables, columns, indexes, fks, checks, then triggers.
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= $1"))).
+		WithArgs("public").
+		WillReturnRows(sqltest.Rows(`
+ schema_name | comment 
+-------------+---------
+ public      |
+`))
+	mk.tableExists("public", "users", true)
+	mk.ExpectQuery(queryColumns).
+		WithArgs("public", "users").
+		WillReturnRows(sqltest.Rows(`
+ table_name | column_name | data_type | formatted | is_nullable | column_default | character_maximum_length | numeric_precision | datetime_precision | numeric_scale | interval_type | character_set_name | collation_name | is_identity | identity_start | identity_increment | identity_last | identity_generation | generation_expression | comment | typtype | typelem | oid | attnum
+------------+-------------+-----------+-----------+-------------+----------------+--------------------------+-------------------+--------------------+---------------+---------------+--------------------+----------------+-------------+----------------+--------------------+------------------+-----------------------+-----------------------+---------+---------+---------+-----+--------
+ users      | id          | bigint   | int8      | NO          |                |                         |                64 |                    |              0 |               |                    |                | NO          |                |                    |                |                     |                       |         | b       |         |  20 |
+`))
+	mk.noIndexes()
+	mk.noFKs()
+	mk.noChecks()
+	// triggersQuery returns: nspname, table_name, relkind, tgname, tgtype, func_schema, func_name, func_def
+	// tgtype: 1=ROW, 2=BEFORE, 4=INSERT, 8=DELETE, 16=UPDATE, 32=TRUNCATE, 64=INSTEAD OF
+	// BEFORE INSERT OR UPDATE FOR EACH ROW = 1+2+4+16 = 23
+	// AFTER DELETE FOR EACH STATEMENT = 8 (no ROW bit)
+	funcDef := "CREATE FUNCTION public.notify_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$"
+	triggerRows := sqlmock.NewRows([]string{"nspname", "table_name", "relkind", "tgname", "tgtype", "func_schema", "func_name", "func_def"}).
+		AddRow("public", "users", "r", "tr_audit", int16(23), "public", "notify_trigger", funcDef).
+		AddRow("public", "users", "r", "tr_cleanup", int16(8), "public", "cleanup_fn", "CREATE FUNCTION public.cleanup_fn() RETURNS trigger AS $$ DELETE FROM log; $$")
+	m.ExpectQuery(queryTriggers).
+		WithArgs("public").
+		WillReturnRows(triggerRows)
+
+	s, err := drv.InspectSchema(context.Background(), "public", &schema.InspectOptions{
+		Mode: schema.InspectSchemas | schema.InspectTables | schema.InspectTriggers,
+	})
+	require.NoError(t, err)
+
+	tbl, ok := s.Table("users")
+	require.True(t, ok)
+	require.Len(t, tbl.Triggers, 2)
+
+	tr1, ok := tbl.Trigger("tr_audit")
+	require.True(t, ok)
+	require.Equal(t, "tr_audit", tr1.Name)
+	require.Equal(t, "BEFORE", string(tr1.ActionTime))
+	require.Equal(t, "FOR EACH ROW", string(tr1.For))
+	require.Len(t, tr1.Events, 2)
+	require.Equal(t, "INSERT", tr1.Events[0].Name)
+	require.Equal(t, "UPDATE", tr1.Events[1].Name)
+	require.Equal(t, tbl, tr1.Table)
+	require.Contains(t, tr1.Body, "RETURN NEW")
+
+	tr2, ok := tbl.Trigger("tr_cleanup")
+	require.True(t, ok)
+	require.Equal(t, "tr_cleanup", tr2.Name)
+	require.Equal(t, "AFTER", string(tr2.ActionTime))
+	require.Equal(t, "FOR EACH STATEMENT", string(tr2.For))
+	require.Len(t, tr2.Events, 1)
+	require.Equal(t, "DELETE", tr2.Events[0].Name)
+	require.Contains(t, tr2.Body, "DELETE FROM log")
+}
+
+func TestDriver_InspectTriggers_empty(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("150000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+	drv.(*Driver).schema = "public"
+
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= $1"))).
+		WithArgs("public").
+		WillReturnRows(sqltest.Rows(`
+ schema_name | comment 
+-------------+---------
+ public      |
+`))
+	mk.tableExists("public", "users", true)
+	mk.ExpectQuery(queryColumns).
+		WithArgs("public", "users").
+		WillReturnRows(sqltest.Rows(`
+ table_name | column_name | data_type | formatted | is_nullable | column_default | character_maximum_length | numeric_precision | datetime_precision | numeric_scale | interval_type | character_set_name | collation_name | is_identity | identity_start | identity_increment | identity_last | identity_generation | generation_expression | comment | typtype | typelem | oid | attnum
+------------+-------------+-----------+-----------+-------------+----------------+--------------------------+-------------------+--------------------+---------------+---------------+--------------------+----------------+-------------+----------------+--------------------+------------------+-----------------------+-----------------------+---------+---------+---------+-----+--------
+ users      | id          | bigint   | int8      | NO          |                |                         |                64 |                    |              0 |               |                    |                | NO          |                |                    |                |                     |                       |         | b       |         |  20 |
+`))
+	mk.noIndexes()
+	mk.noFKs()
+	mk.noChecks()
+	m.ExpectQuery(queryTriggers).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"nspname", "table_name", "relkind", "tgname", "tgtype", "func_schema", "func_name", "func_def"}))
+
+	s, err := drv.InspectSchema(context.Background(), "public", &schema.InspectOptions{
+		Mode: schema.InspectSchemas | schema.InspectTables | schema.InspectTriggers,
+	})
+	require.NoError(t, err)
+	tbl, ok := s.Table("users")
+	require.True(t, ok)
+	require.Empty(t, tbl.Triggers)
+}
+
+func TestDriver_InspectTriggers_skips_unknown_table(t *testing.T) {
+	db, m, err := sqlmock.New()
+	require.NoError(t, err)
+	mk := mock{m}
+	mk.version("150000")
+	drv, err := Open(db)
+	require.NoError(t, err)
+	drv.(*Driver).schema = "public"
+
+	mk.ExpectQuery(sqltest.Escape(fmt.Sprintf(schemasQueryArgs, "= $1"))).
+		WithArgs("public").
+		WillReturnRows(sqltest.Rows(`
+ schema_name | comment 
+-------------+---------
+ public      |
+`))
+	// Only table "users" is in the realm; trigger on "other" should be skipped.
+	mk.tableExists("public", "users", true)
+	mk.ExpectQuery(queryColumns).
+		WithArgs("public", "users").
+		WillReturnRows(sqltest.Rows(`
+ table_name | column_name | data_type | formatted | is_nullable | column_default | character_maximum_length | numeric_precision | datetime_precision | numeric_scale | interval_type | character_set_name | collation_name | is_identity | identity_start | identity_increment | identity_last | identity_generation | generation_expression | comment | typtype | typelem | oid | attnum
+------------+-------------+-----------+-----------+-------------+----------------+--------------------------+-------------------+--------------------+---------------+---------------+--------------------+----------------+-------------+----------------+--------------------+------------------+-----------------------+-----------------------+---------+---------+---------+-----+--------
+ users      | id          | bigint   | int8      | NO          |                |                         |                64 |                    |              0 |               |                    |                | NO          |                |                    |                |                     |                       |         | b       |         |  20 |
+`))
+	mk.noIndexes()
+	mk.noFKs()
+	mk.noChecks()
+	// Trigger on "other" table (not in realm) is skipped.
+	m.ExpectQuery(queryTriggers).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"nspname", "table_name", "relkind", "tgname", "tgtype", "func_schema", "func_name", "func_def"}).
+			AddRow("public", "other", "r", "tr_other", int16(23), "public", "fn", "CREATE FUNCTION fn() RETURNS trigger AS $$ $$"))
+
+	s, err := drv.InspectSchema(context.Background(), "public", &schema.InspectOptions{
+		Mode: schema.InspectSchemas | schema.InspectTables | schema.InspectTriggers,
+	})
+	require.NoError(t, err)
+	tbl, ok := s.Table("users")
+	require.True(t, ok)
+	require.Empty(t, tbl.Triggers)
 }
 
 func TestDriver_InspectCRDBSchema(t *testing.T) {

@@ -17,10 +17,35 @@ func sortViewChanges(changes []schema.Change) ([]schema.Change, error) {
 	return changes, nil // unimplemented.
 }
 
-func (*Diff) triggerDiff(_, _ interface {
+func (d *Diff) triggerDiff(from, to interface {
 	Trigger(string) (*schema.Trigger, bool)
-}, _, _ []*schema.Trigger, _ *schema.DiffOptions) ([]schema.Change, error) {
-	return nil, nil // unimplemented.
+}, fromTriggers, toTriggers []*schema.Trigger, opts *schema.DiffOptions) ([]schema.Change, error) {
+	var changes []schema.Change
+	// Drop triggers that exist in from but not in to.
+	for _, tr := range fromTriggers {
+		if _, ok := to.Trigger(tr.Name); !ok {
+			changes = opts.AddOrSkip(changes, &schema.DropTrigger{T: tr})
+		}
+	}
+	// Add or modify triggers.
+	td, hasTriggerDiffer := d.DiffDriver.(TriggerDiffer)
+	for _, toTr := range toTriggers {
+		fromTr, ok := from.Trigger(toTr.Name)
+		if !ok {
+			changes = opts.AddOrSkip(changes, &schema.AddTrigger{T: toTr})
+			continue
+		}
+		if hasTriggerDiffer {
+			mods, err := td.TriggerDiff(fromTr, toTr)
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range mods {
+				changes = opts.AddOrSkip(changes, c)
+			}
+		}
+	}
+	return changes, nil
 }
 
 // funcDep returns true if f1 depends on f2.
@@ -200,6 +225,11 @@ func dependsOn(c1, c2 schema.Change, _ SortOptions) bool {
 				return ok && schema.IsType(d.C.Type.Type, t)
 			})
 		}
+	case *schema.AddTrigger:
+		// Trigger must be created after the function it executes (Deps).
+		return depOfAdd(c1.T.Deps, c2)
+	case *schema.ModifyTrigger:
+		return depOfAdd(c1.To.Deps, c2)
 	}
 	return false
 }

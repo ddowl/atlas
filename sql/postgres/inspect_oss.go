@@ -531,6 +531,106 @@ func (i *inspect) inspectFuncs(ctx context.Context, r *schema.Realm, opts *schem
 	return rows.Err()
 }
 
+// inspectTriggers queries and appends the triggers in the realm schemas.
+func (i *inspect) inspectTriggers(ctx context.Context, r *schema.Realm, opts *schema.InspectOptions) error {
+	args := make([]any, 0, len(r.Schemas))
+	for _, s := range r.Schemas {
+		args = append(args, s.Name)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+
+	rows, err := i.QueryContext(ctx, fmt.Sprintf(triggersQuery, nArgs(0, len(args))), args...)
+	if err != nil {
+		return fmt.Errorf("postgres: querying triggers: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var schemaName, tableName, relkind, name string
+		var tgtype int16
+		var funcSchema, funcName, funcDef sql.NullString
+		if err := rows.Scan(&schemaName, &tableName, &relkind, &name, &tgtype, &funcSchema, &funcName, &funcDef); err != nil {
+			return fmt.Errorf("postgres: scanning trigger row: %w", err)
+		}
+		s, ok := r.Schema(schemaName)
+		if !ok {
+			return fmt.Errorf("postgres: schema %q for trigger %q was not found in realm", schemaName, name)
+		}
+		tr := &schema.Trigger{Name: name}
+		// relkind: r = table, v = view
+		if relkind == "r" {
+			tbl, ok := s.Table(tableName)
+			if !ok {
+				continue
+			}
+			tr.Table = tbl
+			tbl.Triggers = append(tbl.Triggers, tr)
+		} else if relkind == "v" {
+			v, ok := s.View(tableName)
+			if !ok {
+				continue
+			}
+			tr.View = v
+			v.Triggers = append(v.Triggers, tr)
+		} else {
+			continue
+		}
+		// tgtype bits: 1=ROW, 2=BEFORE, 4=INSERT, 8=DELETE, 16=UPDATE, 32=TRUNCATE, 64=INSTEAD OF
+		const (
+			tgRow      = 1 << 0
+			tgBefore   = 1 << 1
+			tgInsert   = 1 << 2
+			tgDelete   = 1 << 3
+			tgUpdate   = 1 << 4
+			tgTruncate = 1 << 5
+			tgInstead  = 1 << 6
+		)
+		if tgtype&tgRow != 0 {
+			tr.For = "FOR EACH ROW"
+		} else {
+			tr.For = "FOR EACH STATEMENT"
+		}
+		if tgtype&tgInstead != 0 {
+			tr.ActionTime = "INSTEAD OF"
+		} else if tgtype&tgBefore != 0 {
+			tr.ActionTime = "BEFORE"
+		} else {
+			tr.ActionTime = "AFTER"
+		}
+		var events []schema.TriggerEvent
+		if tgtype&tgInsert != 0 {
+			events = append(events, schema.TriggerEvent{Name: "INSERT"})
+		}
+		if tgtype&tgDelete != 0 {
+			events = append(events, schema.TriggerEvent{Name: "DELETE"})
+		}
+		if tgtype&tgUpdate != 0 {
+			events = append(events, schema.TriggerEvent{Name: "UPDATE"})
+		}
+		if tgtype&tgTruncate != 0 {
+			events = append(events, schema.TriggerEvent{Name: "TRUNCATE"})
+		}
+		tr.Events = events
+		if sqlx.ValidString(funcDef) {
+			tr.Body = extractFuncBody(funcDef.String)
+		}
+		// Link trigger to the function it executes when that function exists in the realm.
+		if sqlx.ValidString(funcName) {
+			funcSch := s
+			if sqlx.ValidString(funcSchema) {
+				if sch, ok := r.Schema(funcSchema.String); ok {
+					funcSch = sch
+				}
+			}
+			if f, ok := funcSch.Func(funcName.String); ok {
+				tr.Deps = append(tr.Deps, f)
+			}
+		}
+	}
+	return rows.Err()
+}
+
 // parseFuncArgs parses a PostgreSQL function argument list (e.g. from pg_get_function_arguments)
 // into schema.FuncArg values. Format: [argmode ] [argname ] argtype [ DEFAULT expr ] [, ...].
 func parseFuncArgs(s string, sc *schema.Schema, i *inspect) ([]*schema.FuncArg, error) {
@@ -1805,6 +1905,27 @@ WHERE
 	AND p.prokind = 'f'
 ORDER BY
 	n.nspname, p.proname
+`
+	// Query to list triggers. Excludes internal constraint triggers (tgisinternal).
+	// tgtype bits: 1=ROW, 2=BEFORE, 4=INSERT, 8=DELETE, 16=UPDATE, 32=TRUNCATE, 64=INSTEAD OF.
+	triggersQuery = `
+SELECT
+	n.nspname,
+	c.relname AS table_name,
+	c.relkind,
+	t.tgname,
+	t.tgtype,
+	np.nspname AS func_schema,
+	p.proname AS func_name,
+	pg_catalog.pg_get_functiondef(p.oid) AS func_def
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+JOIN pg_catalog.pg_namespace np ON np.oid = p.pronamespace
+WHERE NOT t.tgisinternal
+AND n.nspname IN (%s)
+ORDER BY n.nspname, c.relname, t.tgname
 `
 	// Query to list foreign-keys.
 	fksQuery = `
